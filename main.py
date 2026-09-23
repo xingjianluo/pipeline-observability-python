@@ -1,6 +1,9 @@
 from fastapi import FastAPI
 
-app = FastAPI()
+from pipelineobs.api import router as obs_router
+
+app = FastAPI(title="pipeline-observability")
+app.include_router(obs_router)
 
 
 @app.get("/")
