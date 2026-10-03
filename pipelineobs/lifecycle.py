@@ -14,17 +14,44 @@ from __future__ import annotations
 
 import threading
 
-from .models import AttemptRecord, EventType, RunEvent, RunState, RunStatus
+from .models import AttemptRecord, EventRecord, EventType, RunEvent, RunState, RunStatus
+
+
+def canonical_outcome(state: RunState) -> tuple[bool, float, float | None] | None:
+    """由运行全部尝试推导顺序无关的终态结论 (succeeded, finished_ts, latency)。
+
+    未进入终态返回 None。成功取最早成功的尝试；失败取最大尝试号的失败尝试。
+    批量回补、实时上报与追溯重算共用同一规则，保证结论一致。
+    """
+    succeeded_attempts = sorted(
+        a.attempt for a in state.attempts.values()
+        if a.status is RunStatus.SUCCEEDED)
+    if succeeded_attempts:
+        win = state.attempts[succeeded_attempts[0]]
+        return True, win.finished_ts, win.latency
+    failed = [a.attempt for a in state.attempts.values()
+              if a.status is RunStatus.FAILED]
+    if failed:
+        win = state.attempts[max(failed)]
+        return False, win.finished_ts, win.latency
+    return None
 
 
 class LifecycleManager:
     def __init__(self, lock: threading.RLock | None = None) -> None:
         self._lock = lock or threading.RLock()
         self._runs: dict[tuple[str, str], RunState] = {}
+        # 已通过去重、实际进入生命周期的事件留痕，按流水线分桶
+        self._journal: dict[str, list[EventRecord]] = {}
 
     @property
     def lock(self) -> threading.RLock:
         return self._lock
+
+    def journal(self, pipeline_id: str) -> list[EventRecord]:
+        """返回该流水线的事件留痕副本（追溯重算的事实来源）。"""
+        with self._lock:
+            return list(self._journal.get(pipeline_id, ()))
 
     def ingest(self, event: RunEvent) -> tuple[RunState, str]:
         """提交事件，返回 (最新运行状态, 判定依据)。
@@ -49,6 +76,11 @@ class LifecycleManager:
             state.dedup_keys.add(dedup)
 
             order_ts = event.event_ts if event.event_ts is not None else event.received_ts
+            self._journal.setdefault(event.pipeline_id, []).append(EventRecord(
+                pipeline_id=event.pipeline_id, run_id=event.run_id,
+                attempt=event.attempt, event_type=event.event_type,
+                order_ts=order_ts, ts_present=event.event_ts is not None,
+                received_ts=event.received_ts, detail=event.detail))
             if state.last_event_ts is None or order_ts >= state.last_event_ts:
                 state.last_event_ts = order_ts
             if state.first_seen_ts is None:

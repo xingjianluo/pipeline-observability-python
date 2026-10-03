@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import asdict
+from enum import Enum
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from dataclasses import asdict
 
-from .models import FreshnessState
+from .models import BackfillItem, FreshnessState
 from .store import PipelineStore
 
 logger = logging.getLogger("pipelineobs")
@@ -143,3 +144,82 @@ def post_alert_check(pipeline_id: str, payload: AlertIn) -> dict:
                 pipeline_id, alert.suppressed, alert.reason,
                 alert.consecutive_failures)
     return asdict(alert)
+
+
+# ---------------------------------------------------------------------------
+# 历史事件批量回补
+# ---------------------------------------------------------------------------
+
+
+class BackfillEventIn(BaseModel):
+    # 放宽入口约束：批次内坏数据必须由回补器逐条给出可区分原因，
+    # 而不是被整体 422 拒掉（模型层只负责接住任意 JSON 形状）
+    pipeline_id: Any = ""
+    run_id: Any = ""
+    attempt: Any = 1
+    event_type: Any = Field(description="started | succeeded | failed")
+    event_ts: Any = Field(default=None, description="事件时间戳；缺失用接收时间")
+    detail: Any = ""
+    received_ts: Any = None
+
+
+class BackfillIn(BaseModel):
+    events: list[BackfillEventIn] = Field(default_factory=list)
+
+
+def _jsonable(obj: Any) -> Any:
+    """dataclass/枚举/列表递归转为可 JSON 序列化的普通结构。"""
+    if isinstance(obj, Enum):
+        return obj.value
+    if hasattr(obj, "__dataclass_fields__"):
+        return {k: _jsonable(v) for k, v in asdict(obj).items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    return obj
+
+
+@router.post("/events:batch")
+def post_events_batch(payload: BackfillIn) -> dict:
+    """历史事件批量回补。
+
+    与 POST /events 共用同一处理路径：乱序、跨流水线/运行、重复、坏数据
+    混在一批里也逐条给结论；非法事件单独标记，不影响其余事件生效。
+    """
+    items = [
+        BackfillItem(pipeline_id=e.pipeline_id, run_id=e.run_id,
+                     attempt=e.attempt, event_type=e.event_type,
+                     event_ts=e.event_ts, detail=e.detail,
+                     received_ts=e.received_ts)
+        for e in payload.events]
+    logger.info("[backfill] batch input size=%d", len(items))
+    result = store.ingest_batch(items)
+    logger.info("[backfill] batch result total=%d accepted=%d duplicate=%d "
+                "invalid=%d", result.total, result.accepted,
+                result.duplicate, result.invalid)
+    return _jsonable(result)
+
+
+# ---------------------------------------------------------------------------
+# 历史窗口追溯重算
+# ---------------------------------------------------------------------------
+
+
+class ReplayIn(BaseModel):
+    end_ts: float = Field(description="复盘截至时刻（按事件时间可见性截断）")
+    window_seconds: float = Field(gt=0)
+    threshold: int = Field(default=3, ge=1)
+    cooldown_seconds: float = Field(default=300.0, ge=0)
+
+
+@router.post("/pipelines/{pipeline_id}/replay")
+def post_replay(pipeline_id: str, payload: ReplayIn) -> dict:
+    """追溯重算历史窗口并与当前在线结论对比。只读，不改动在线状态、不发告警。"""
+    try:
+        result = store.replay_window(
+            pipeline_id, payload.end_ts, payload.window_seconds,
+            payload.threshold, payload.cooldown_seconds)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _jsonable(result)
