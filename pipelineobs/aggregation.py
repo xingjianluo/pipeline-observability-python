@@ -54,7 +54,8 @@ class Aggregator:
         """登记或按最终收敛结论更新一个运行。
 
         - 首次见到该 run：added；
-        - 结论与终态时间均未变：duplicate_run；
+        - 结论与终态时间均未变：duplicate_run（耗时被迟到事件回填时
+          就地修正为 latency_updated，保证窗口统计与到达顺序无关）；
         - 失败后重试成功：updated_to_success（成功不回退为失败）；
         - 成功后收到成功（可能时间更新）：保持成功，时间取较早者不回退。
         """
@@ -69,6 +70,10 @@ class Aggregator:
                 return "duplicate_run"
             if existing.succeeded == succeeded and \
                     existing.finished_ts == float(finished_ts):
+                if latency is not None and existing.latency != latency:
+                    runs[run_id] = _Outcome(run_id, succeeded,
+                                            float(finished_ts), latency)
+                    return "latency_updated"
                 return "duplicate_run"
             if succeeded and not existing.succeeded:
                 runs[run_id] = _Outcome(
@@ -115,6 +120,32 @@ class Aggregator:
                 success_rate=rate, latencies=list(latencies),
                 avg_latency=avg, p95_latency=self._p95(latencies))
 
+    def range_window(self, pipeline_id: str, start_ts: float,
+                     end_ts: float) -> WindowAggregate:
+        """任意半开区间 [start_ts, end_ts) 的统计（只读，供追溯重算使用）。"""
+        if end_ts <= start_ts:
+            raise ValueError("end_ts must be greater than start_ts")
+        with self._lock:
+            total = succ = fail = 0
+            latencies: list[float] = []
+            for o in self._ordered(pipeline_id):
+                if start_ts <= o.finished_ts < end_ts:
+                    total += 1
+                    if o.succeeded:
+                        succ += 1
+                    else:
+                        fail += 1
+                    if o.latency is not None:
+                        latencies.append(o.latency)
+            rate = succ / total if total else 0.0
+            avg = sum(latencies) / len(latencies) if latencies else None
+            return WindowAggregate(
+                pipeline_id=pipeline_id, window_start=start_ts,
+                window_end=end_ts, total_runs=total, succeeded_runs=succ,
+                failed_runs=fail, success_rate=rate,
+                latencies=list(latencies), avg_latency=avg,
+                p95_latency=self._p95(latencies))
+
     def consecutive_failures(self, pipeline_id: str,
                              end_ts: float) -> tuple[int, tuple[str, ...]]:
         """返回截至 end_ts 的尾部连续失败次数与失败 run_id 序列（全序确定）。"""
@@ -128,8 +159,12 @@ class Aggregator:
         streak.reverse()
         return len(streak), tuple(streak)
 
-    def check_alert(self, pipeline_id: str, end_ts: float,
-                    threshold: int, cooldown_seconds: float) -> Alert:
+    def evaluate_alert(self, pipeline_id: str, end_ts: float,
+                       threshold: int, cooldown_seconds: float) -> Alert:
+        """只读评估：返回此刻 check_alert 会给出的结论，但不更新抑制状态。
+
+        供追溯重算/复盘对比使用，调用它不会影响后续真实告警的抑制。
+        """
         with self._lock:
             count, streak = self.consecutive_failures(pipeline_id, end_ts)
             if count < threshold:
@@ -143,6 +178,15 @@ class Aggregator:
             if last is not None and end_ts - last[0] < cooldown_seconds:
                 return Alert(pipeline_id, end_ts, count, threshold,
                              suppressed=True, reason="cooldown_active")
-            self._last_alert[pipeline_id] = (end_ts, streak)
             return Alert(pipeline_id, end_ts, count, threshold,
                          suppressed=False, reason="threshold_reached")
+
+    def check_alert(self, pipeline_id: str, end_ts: float,
+                    threshold: int, cooldown_seconds: float) -> Alert:
+        with self._lock:
+            alert = self.evaluate_alert(pipeline_id, end_ts, threshold,
+                                        cooldown_seconds)
+            if not alert.suppressed:
+                _, streak = self.consecutive_failures(pipeline_id, end_ts)
+                self._last_alert[pipeline_id] = (end_ts, streak)
+            return alert

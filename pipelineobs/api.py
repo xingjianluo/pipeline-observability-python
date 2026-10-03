@@ -72,6 +72,56 @@ def post_event(payload: EventIn) -> dict:
             "aggregate_reason": result.aggregate_reason}
 
 
+class BatchEventsIn(BaseModel):
+    events: list[Any] = Field(description="历史事件列表，逐条校验、逐条结论")
+
+
+@router.post("/events/batch", status_code=200)
+def post_events_batch(payload: BatchEventsIn) -> dict:
+    """历史事件批量回补：部分失败不丢整批，重复提交幂等。"""
+    received = time.time()
+    logger.info("[batch] input count=%d received_ts=%.3f",
+                len(payload.events), received)
+    result = store.ingest_batch(payload.events, received_ts=received)
+    for item in result.items:
+        logger.info("[batch] item=%d decision status=%s lifecycle=%s "
+                    "aggregate=%s error=%s", item.index, item.status,
+                    item.lifecycle_reason, item.aggregate_reason, item.error)
+    logger.info("[batch] summary total=%d applied=%d duplicates=%d rejected=%d",
+                result.summary.total, result.summary.applied,
+                result.summary.duplicates, result.summary.rejected)
+    return {"items": [asdict(i) for i in result.items],
+            "summary": asdict(result.summary)}
+
+
+class RecomputeIn(BaseModel):
+    window_start: float
+    window_end: float
+    threshold: int = Field(default=3, ge=1)
+    cooldown_seconds: float = Field(default=300.0, ge=0)
+
+
+@router.post("/pipelines/{pipeline_id}/recompute")
+def post_recompute(pipeline_id: str, payload: RecomputeIn) -> dict:
+    """历史窗口追溯重算：只读复盘，不改在线状态、不触发告警。"""
+    logger.info("[recompute] input pipeline=%s window=[%.3f,%.3f) threshold=%d",
+                pipeline_id, payload.window_start, payload.window_end,
+                payload.threshold)
+    try:
+        report = store.recompute_window(
+            pipeline_id, payload.window_start, payload.window_end,
+            payload.threshold, payload.cooldown_seconds)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    logger.info("[recompute] decision replayed=%d stats(total=%d ok=%d "
+                "fail=%d) alert=%s online_failures=%d diffs=%s",
+                report.replayed_events, report.stats.total_runs,
+                report.stats.succeeded_runs, report.stats.failed_runs,
+                report.alert.reason, report.online_consecutive_failures,
+                list(report.differences))
+    return asdict(report)
+
+
 @router.get("/pipelines/{pipeline_id}/runs/{run_id}")
 def get_run(pipeline_id: str, run_id: str) -> dict:
     state = store.get_run(pipeline_id, run_id)

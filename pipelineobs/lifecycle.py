@@ -84,7 +84,13 @@ class LifecycleManager:
 
         if event.event_type is EventType.STARTED:
             if attempt.status in (RunStatus.SUCCEEDED, RunStatus.FAILED):
-                # 终态之后迟到的 started，不能回退。
+                # 终态之后迟到的 started：状态不回退，但仍回填 started_ts
+                # 并重算耗时，保证记录与事件到达顺序无关。
+                if attempt.started_ts is None or ts < attempt.started_ts:
+                    attempt.started_ts = ts
+                if attempt.finished_ts is not None:
+                    attempt.latency = max(
+                        0.0, attempt.finished_ts - attempt.started_ts)
                 return False, "attempt_terminal_held"
             if attempt.started_ts is None or ts < attempt.started_ts:
                 attempt.started_ts = ts
