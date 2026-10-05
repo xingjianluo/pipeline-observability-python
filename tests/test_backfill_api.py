@@ -48,6 +48,84 @@ def test_batch_endpoint_partial_failure_and_per_item_reasons(client):
     assert r.json()["status"] == "succeeded"
 
 
+def test_batch_endpoint_survives_non_object_and_missing_event_type(client):
+    """真实入口混入非对象条目与缺 event_type 的条目：整批不再被 422 打回，
+    坏条目逐条给出可区分原因，合法条目照常生效。"""
+    r = client.post("/api/v1/events:batch", json={"events": [
+        {"pipeline_id": "p", "run_id": "r1", "event_type": "started",
+         "event_ts": 100},
+        "oops-not-an-object",                    # 非对象：字符串
+        42,                                      # 非对象：数字
+        None,                                    # 非对象：null
+        ["not", "an", "object"],                 # 非对象：数组
+        {"pipeline_id": "p", "run_id": "r2",
+         "event_ts": 120},                       # 缺 event_type 字段
+        {"pipeline_id": "p", "run_id": "r1", "event_type": "succeeded",
+         "event_ts": 110},
+        {"pipeline_id": "p", "run_id": "r3", "event_type": "failed",
+         "event_ts": 130},
+    ]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert (body["total"], body["accepted"], body["duplicate"],
+            body["invalid"]) == (8, 3, 0, 5)
+    results = {x["index"]: x for x in body["results"]}
+    for i in (1, 2, 3, 4):
+        assert results[i]["status"] == "invalid"
+        assert results[i]["reason"] == "item_not_object"
+    assert results[5]["status"] == "invalid"
+    assert results[5]["reason"] == "missing_event_type"
+    # 合法条目照常生效
+    assert results[0]["status"] == "accepted"
+    assert results[6]["run_status"] == "succeeded"
+    assert results[7]["run_status"] == "failed"
+    assert client.get("/api/v1/pipelines/p/runs/r1").json()["status"] \
+        == "succeeded"
+    assert client.get("/api/v1/pipelines/p/runs/r3").json()["status"] \
+        == "failed"
+    assert client.get("/api/v1/pipelines/p/runs/r2").status_code == 404
+
+
+def test_batch_endpoint_with_bad_data_equals_single_submissions(client):
+    """走真实批量入口（夹带坏数据）的最终效果 == 合法事件逐条走 /events。"""
+    good = [
+        {"pipeline_id": "p", "run_id": "r1", "attempt": 1,
+         "event_type": "started", "event_ts": 100},
+        {"pipeline_id": "p", "run_id": "r1", "attempt": 1,
+         "event_type": "failed", "event_ts": 110},
+        {"pipeline_id": "p", "run_id": "r1", "attempt": 2,
+         "event_type": "started", "event_ts": 120},
+        {"pipeline_id": "p", "run_id": "r1", "attempt": 2,
+         "event_type": "succeeded", "event_ts": 130},
+        {"pipeline_id": "p", "run_id": "r2", "attempt": 1,
+         "event_type": "failed", "event_ts": 140},
+    ]
+    batch_payload = {"events": [good[0], "garbage", good[1], good[2],
+                                {"run_id": "no-type"}, good[3], good[4]]}
+    r = client.post("/api/v1/events:batch", json=batch_payload)
+    assert r.status_code == 200, r.text
+    assert r.json()["accepted"] == 5 and r.json()["invalid"] == 2
+    via_batch = client.get("/api/v1/pipelines/p/runs").json()["runs"]
+    via_batch_agg = client.post(
+        "/api/v1/pipelines/p/aggregate",
+        json={"end_ts": 1000, "window_seconds": 1000}).json()
+
+    # 参照：同一批合法事件逐条走单条上报入口
+    api_mod.store = PipelineStore()
+    for e in good:
+        resp = client.post("/api/v1/events", json=e)
+        assert resp.status_code == 200
+    via_single = client.get("/api/v1/pipelines/p/runs").json()["runs"]
+    via_single_agg = client.post(
+        "/api/v1/pipelines/p/aggregate",
+        json={"end_ts": 1000, "window_seconds": 1000}).json()
+
+    assert via_batch == via_single
+    assert via_batch_agg == via_single_agg
+    assert via_single_agg["avg_latency"] == 10.0  # 130-120（成功尝试）
+    assert via_single_agg["p95_latency"] == 10.0
+
+
 def test_batch_endpoint_idempotent_retry(client):
     payload = {"events": [
         {"pipeline_id": "p", "run_id": "r1", "event_type": "failed",

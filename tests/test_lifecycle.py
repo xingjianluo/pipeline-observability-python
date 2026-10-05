@@ -86,10 +86,35 @@ def test_stale_old_attempt_cannot_change_conclusion():
     submit(lm, ev("r1", 1, "failed", 110))
     submit(lm, ev("r1", 2, "started", 120))
     submit(lm, ev("r1", 2, "succeeded", 130))
-    # attempt1 迟到的 started 不影响已成功的结论
+    # attempt1 迟到的 started 不影响已成功的结论，状态不回退；
+    # 但它带回的开始时间事实会被记录并补上耗时（顺序无关保证）
     state, reason = submit(lm, ev("r1", 1, "started", 100, recv=140))
     assert state.status is RunStatus.SUCCEEDED
-    assert reason == "attempt_terminal_held"
+    assert reason == "attempt_started_late"
+    assert state.attempts[1].started_ts == 100
+    assert state.attempts[1].latency == 10
+    # 同一 (attempt, started) 再次上报由去重拦截，不重复生效
+    state, reason = submit(lm, ev("r1", 1, "started", 105, recv=141))
+    assert reason == "duplicate_event"
+    assert state.attempts[1].started_ts == 100  # 取最早，不被覆盖
+
+
+def test_late_started_backfills_latency_order_independent():
+    """started 与终态两条事件无论谁先到达，耗时结论一致。"""
+    def build(order):
+        lm = LifecycleManager()
+        for e in order:
+            submit(lm, e)
+        return lm.get("p", "r1").attempts[1]
+
+    terminal_first = build([ev("r1", 1, "succeeded", 110),
+                            ev("r1", 1, "started", 100)])
+    started_first = build([ev("r1", 1, "started", 100),
+                           ev("r1", 1, "succeeded", 110)])
+    for a in (terminal_first, started_first):
+        assert a.status is RunStatus.SUCCEEDED
+        assert a.started_ts == 100 and a.finished_ts == 110
+        assert a.latency == 10
 
 
 def test_missing_event_ts_uses_receive_order():

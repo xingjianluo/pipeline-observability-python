@@ -30,6 +30,9 @@
   - 迟到事件不能让已进入终态的尝试回退（`attempt_terminal_held`）；
   - 同一尝试出现冲突终态时，按**事件时间戳**决胜；时间戳缺失时按**接收顺序**
     决胜（先到的终态成立）。
+  - 终态之后迟到的 `started` 同样不能回退状态，但它携带的“开始时间”事实
+    仍会被记录（取最早者）并据此重算耗时（`attempt_started_late`）——
+    只要 `started` 与终态两条事件都到齐，**耗时必然有值且与到达顺序无关**。
   - `failed` 后收到新尝试的 `started` 是合法重试（`retry_started`），运行
     重新 `running`；旧尝试的迟到事件不会影响新结论。
 - **聚合单元是“运行”**：一个 `run_id` 在窗口中只出现一次，取最终收敛结论。
@@ -80,7 +83,11 @@
 为了让“批量回补 / 实时上报 / 并发”三种入口的结论完全一致，聚合写入采用
 **顺序无关的规范终态结论**（`lifecycle.canonical_outcome`）：每次事件生效后都由
 运行的全部尝试重新推导——成功取最早成功尝试的终态，否则取最大尝试号的失败终态。
-因此同一组事件无论按什么顺序、经哪个入口、重试多少遍，窗口统计与运行状态都相同。
+耗时同样顺序无关：`started_ts` 取该尝试全部 `started` 事件的最早时间，终态时间
+按冲突决胜规则确定，`latency = max(0, finished_ts - started_ts)` 由两者推导，
+即使终态事件先于 `started` 到达，迟到的 `started` 也会把耗时补上。
+因此同一组事件无论按什么顺序、经哪个入口、重试多少遍，窗口统计（含 avg/p95
+耗时）、运行状态与告警结论都相同。
 
 ## 四、历史事件批量回补
 
@@ -93,10 +100,18 @@
   invalid`。
 - **与单条上报完全等价**：合法事件一律走与 `POST /events` 相同的
   `store.apply_event` 处理路径，整批最终结果等同于把同样事件一条条单独上报。
-- **坏数据不拖垮整批**：不合法事件不进入状态机，其余事件照常生效，且原因可区分：
-  `missing_pipeline_id` / `missing_run_id` / `invalid_event_type` /
-  `invalid_attempt` / `invalid_event_ts` / `invalid_received_ts` /
-  `invalid_detail`。
+- **坏数据不拖垮整批**：入口只要求 `events` 是数组，元素可以是任意 JSON
+  值；不合法条目不进入状态机，其余事件照常生效，且原因可区分：
+  - `item_not_object`：条目不是对象（字符串/数字/null/数组等）；
+  - `missing_pipeline_id` / `missing_run_id`：缺标识字段；
+  - `missing_event_type`：缺 `event_type` 字段；
+  - `invalid_event_type` / `invalid_attempt` / `invalid_event_ts` /
+    `invalid_received_ts` / `invalid_detail`：字段存在但取值非法。
+  模型层不会对单条坏数据返回 422；只有请求体整体不是
+  `{"events": [...]}` 形状时才整体拒绝。
+- **乱序耗时一致**：同一批历史事件换任意提交顺序回补，窗口的 avg/p95
+  耗时与计数、成功失败数一样稳定，且与按时间顺序逐条上报的结论相同
+  （由上节的顺序无关耗时推导保证）。
 - **幂等**：重复提交同一批（哪怕乱序重试）只会得到 `duplicate`，不多算、
   不重复告警——去重仍由生命周期的 `(run, attempt, event_type)` 与聚合的规范终态
   写入共同保证。
@@ -154,7 +169,7 @@ curl -X POST localhost:8000/api/v1/events -H 'Content-Type: application/json' -d
 响应中 `lifecycle_reason` / `aggregate_reason` 给出该次上报的判定依据；
 `unknown` 新鲜度的 `reason` 字段给出可区分的失败原因。
 
-批量回补示例（顺序可乱、可重复、可夹带坏数据）：
+批量回补示例（顺序可乱、可重复、可夹带坏数据，包括非对象条目）：
 
 ```bash
 curl -X POST localhost:8000/api/v1/events:batch \
@@ -162,10 +177,16 @@ curl -X POST localhost:8000/api/v1/events:batch \
   {"pipeline_id":"p","run_id":"r1","event_type":"started","event_ts":100},
   {"pipeline_id":"p","run_id":"r1","event_type":"succeeded","event_ts":110},
   {"pipeline_id":"p","run_id":"r1","event_type":"succeeded","event_ts":110},
+  "oops-not-an-object",
+  {"pipeline_id":"p","run_id":"r2","event_ts":120},
   {"pipeline_id":"p","run_id":"x","attempt":0,"event_type":"weird"}
 ]}'
-# => {"total":4,"accepted":2,"duplicate":1,"invalid":1,
-#     "results":[{"index":3,"status":"invalid","reason":"invalid_event_type", ...}]}
+# => {"total":6,"accepted":2,"duplicate":1,"invalid":3,
+#     "results":[...,
+#       {"index":3,"status":"invalid","reason":"item_not_object"},
+#       {"index":4,"status":"invalid","reason":"missing_event_type"},
+#       {"index":5,"status":"invalid","reason":"invalid_attempt"}]}
+# 合法条目照常生效：GET /api/v1/pipelines/p/runs/r1 => succeeded
 ```
 
 追溯重算示例（复盘 `end=200` 之前的 `[0,200)` 窗口，阈值 2）：
@@ -186,10 +207,11 @@ uv run pytest                       # 运行全部单测（日志实时打印输
 uv run uvicorn main:app --reload    # 启动服务
 ```
 
-测试覆盖（共 47 个用例）：
+测试覆盖（共 51 个用例）：
 
 - `tests/test_lifecycle.py`：重复上报、乱序上报、顺序无关收敛、重试区分、
-  旧尝试迟到事件、时间戳缺失；
+  旧尝试迟到事件（迟到 `started` 补耗时、状态不回退）、耗时顺序无关、
+  时间戳缺失；
 - `tests/test_freshness.py`：fresh/lagging/stale 边界、时钟回拨、时间戳/间隔
   缺失、间隔调小需确认、调大免确认；
 - `tests/test_aggregation.py`：半开窗口边界、成功率与 p95、幂等、告警阈值/
@@ -197,13 +219,37 @@ uv run uvicorn main:app --reload    # 启动服务
 - `tests/test_api.py`：经 HTTP 入口复现上述场景，含时钟回拨、窗口边界与
   并发上报一致性；
 - `tests/test_backfill.py`：乱序批量与逐条单报等价、逐条结论、部分失败原因
-  可区分且不丢合法事件、重复/乱序批次幂等、跨流水线、失败后重试成功只计一次；
+  可区分且不丢合法事件、重复/乱序批次幂等、跨流水线、失败后重试成功只计一次、
+  **乱序回补耗时一致**（逆序/交错/200 种全排列抽查的 avg/p95 与逐条上报相同）、
+  终态先到时 `started` 后补耗时；
 - `tests/test_replay.py`：截至时刻截断重建、失败→重试成功的差异、
   重算不改在线状态/不真发告警/不消费抑制、无差异场景、与“当时逐条上报”一致；
-- `tests/test_concurrency.py`：回补与实时上报并发最终结论与任意逐条顺序一致、
-  乱序重试并发幂等、3000 条批次耗时与并发读不被长时间阻塞；
-- `tests/test_backfill_api.py`：批量/重算的 HTTP 端到端，含部分失败、幂等、
-  重算无告警副作用、与单条上报入口并发及原有用法兼容。
+- `tests/test_concurrency.py`：回补与实时上报并发最终结论（含耗时）与任意
+  逐条顺序一致、乱序重试并发幂等（含耗时与告警结论稳定）、3000 条批次耗时
+  与并发读不被长时间阻塞；
+- `tests/test_backfill_api.py`：批量/重算的 HTTP 端到端，含**非对象条目与缺
+  `event_type` 条目逐条标记不拖垮整批**、夹坏数据的批量入口与逐条单报等价、
+  幂等、重算无告警副作用、与单条上报入口并发及原有用法兼容。
 
 单测以 `log_cli` 实时输出形如
-`INPUT ... => DECISION state=... reason=...` 的输入与判定依据。
+`INPUT ... => DECISION state=... reason=...` 的输入与判定依据；
+批量回补场景另输出 `[backfill] idx=N accepted/duplicate/invalid ... reason=...`
+的逐条结论，可直接从日志确认每个用例覆盖了哪些业务路径。
+
+### 本地验证这几类场景
+
+```bash
+uv sync
+# 坏数据逐条结论（真实 HTTP 入口：非对象条目 + 缺 event_type）
+uv run pytest tests/test_backfill_api.py -k "non_object or bad_data"
+# 乱序回补耗时一致性（含全排列抽查与终态先到）
+uv run pytest tests/test_backfill.py -k "latency"
+# 回补与实时并发、乱序重试幂等（含耗时与告警稳定性）
+uv run pytest tests/test_concurrency.py
+# 全量回归
+uv run pytest
+```
+
+也可以启动服务后用上面的 `curl` 示例手工验证：夹带坏数据的批量请求返回
+200 且逐条给出 `reason`；把同一批事件换个顺序再发一遍，第二次全部
+`duplicate`，窗口统计（含 `avg_latency` / `p95_latency`）不变。

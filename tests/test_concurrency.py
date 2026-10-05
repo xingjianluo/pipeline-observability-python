@@ -10,6 +10,12 @@ from pipelineobs.store import PipelineStore
 log = logging.getLogger("test.concurrency")
 
 
+def _window_sig(w):
+    """窗口签名：计数 + 耗时，任一被并发/重试弄乱都会被发现。"""
+    return (w.total_runs, w.succeeded_runs, w.failed_runs,
+            tuple(sorted(w.latencies)), w.avg_latency, w.p95_latency)
+
+
 def _reference_snapshot(events):
     """参照：把全部事件逐条喂给全新 store（随机到达顺序）。"""
     ref = PipelineStore()
@@ -23,8 +29,7 @@ def _reference_snapshot(events):
         state[(st.pipeline_id, st.run_id)] = st.status.value
     windows = {}
     for pid in sorted({e.pipeline_id for e in events}):
-        w = ref.window(pid, 1_000_000, 1_000_000)
-        windows[pid] = (w.total_runs, w.succeeded_runs, w.failed_runs)
+        windows[pid] = _window_sig(ref.window(pid, 1_000_000, 1_000_000))
     return state, windows
 
 
@@ -34,27 +39,35 @@ def _snapshot(store, pipelines):
         state[(st.pipeline_id, st.run_id)] = st.status.value
     windows = {}
     for pid in pipelines:
-        w = store.window(pid, 1_000_000, 1_000_000)
-        windows[pid] = (w.total_runs, w.succeeded_runs, w.failed_runs)
+        windows[pid] = _window_sig(store.window(pid, 1_000_000, 1_000_000))
     return state, windows
 
 
 def _build_events():
     events = []
-    # p1：单终态成功
+    # p1：started + succeeded，每条运行都有耗时
     for i in range(400):
-        events.append(BackfillItem("p1", f"r{i}", 1, "succeeded",
+        events.append(BackfillItem("p1", f"r{i}", 1, "started",
                                    float(1000 + i)))
-    # p2：先失败后重试成功（同一 run 两条事件，顺序无关地应收敛为成功 1 条）
+        events.append(BackfillItem("p1", f"r{i}", 1, "succeeded",
+                                   float(1000 + i) + 0.5))
+    # p2：先失败后重试成功（同一 run 四条事件，顺序无关地应收敛为成功 1 条，
+    # 耗时取成功尝试的 started->succeeded）
     for i in range(200):
-        events.append(BackfillItem("p2", f"r{i}", 1, "failed",
+        events.append(BackfillItem("p2", f"r{i}", 1, "started",
                                    float(2000 + 2 * i)))
+        events.append(BackfillItem("p2", f"r{i}", 1, "failed",
+                                   float(2000 + 2 * i) + 0.5))
+        events.append(BackfillItem("p2", f"r{i}", 2, "started",
+                                   float(2000 + 2 * i) + 0.75))
         events.append(BackfillItem("p2", f"r{i}", 2, "succeeded",
                                    float(2000 + 2 * i + 1)))
-    # p3：纯失败
+    # p3：纯失败，带 started，失败运行也有耗时
     for i in range(300):
-        events.append(BackfillItem("p3", f"r{i}", 1, "failed",
+        events.append(BackfillItem("p3", f"r{i}", 1, "started",
                                    float(3000 + i)))
+        events.append(BackfillItem("p3", f"r{i}", 1, "failed",
+                                   float(3000 + i) + 0.25))
     return events
 
 
@@ -94,16 +107,27 @@ def test_backfill_concurrent_with_realtime_ingest():
     state, win = _snapshot(store, ("p1", "p2", "p3"))
     assert state == ref_state
     assert win == ref_win
-    assert win["p1"] == (400, 400, 0)
-    assert win["p2"] == (200, 200, 0)
-    assert win["p3"] == (300, 0, 300)
+    # 计数与耗时都与参照一致（参照本身即“任意逐条顺序”的一种）
+    assert win["p1"][:3] == (400, 400, 0)
+    assert win["p1"][4:] == (0.5, 0.5)          # avg / p95
+    assert len(win["p1"][3]) == 400             # 每条运行都有耗时
+    assert win["p2"][:3] == (200, 200, 0)
+    assert win["p2"][4:] == (0.25, 0.25)
+    assert win["p3"][:3] == (300, 0, 300)
+    assert win["p3"][4:] == (0.25, 0.25)
 
 
 def test_backfill_shuffled_retry_idempotent_under_concurrency():
-    events = _build_events()[:600]
+    # 全部事件（p1 成功 / p2 失败→重试成功 / p3 纯失败），覆盖耗时与告警场景
+    events = _build_events()
     store = PipelineStore()
     store.ingest_batch(events)
-    expected_state, expected_win = _snapshot(store, ("p1", "p2"))
+    expected_state, expected_win = _snapshot(store, ("p1", "p2", "p3"))
+    # 基线里每条运行都必须已有耗时，否则“重试后耗时一致”无从谈起
+    assert all(sig[4] is not None for sig in expected_win.values())
+    # 告警结论基线（只读判定，不消费抑制状态）
+    alert_before = store.peek_alert("p3", 1_000_000, 3, 300.0)
+    assert alert_before.suppressed is False  # 300 连续失败，理应触发
 
     def worker(seed):
         rnd = random.Random(seed)
@@ -118,9 +142,12 @@ def test_backfill_shuffled_retry_idempotent_under_concurrency():
         t.start()
     for t in threads:
         t.join()
-    state, win = _snapshot(store, ("p1", "p2"))
+    state, win = _snapshot(store, ("p1", "p2", "p3"))
     assert state == expected_state
     assert win == expected_win
+    # 乱序重试多遍后告警结论（含连续失败数与序列）不变
+    alert_after = store.peek_alert("p3", 1_000_000, 3, 300.0)
+    assert alert_after == alert_before
 
 
 def test_large_batch_is_fast_and_does_not_block_reads():

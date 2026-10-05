@@ -5,6 +5,8 @@
 - 合法事件一律调用 store.apply_event —— 与 POST /events 单条上报同一代码路径，
   因此整批结果 == 把这些事件逐条单独上报；
 - 坏数据只影响自己：invalid 事件不进状态机，其余事件照常生效；
+  非对象条目（item_not_object）、缺事件类型（missing_event_type）等
+  也都只逐条标记，不会让整个请求被 422 打回；
 - 逐条获取同一把锁而非整批长事务：单条处理与实时上报完全互斥，
   但读请求与其他上报可在事件之间穿插，几千条的批次也不会长时间
   卡住其他请求；
@@ -46,8 +48,11 @@ def validate_item(item: BackfillItem) -> tuple[dict, str | None]:
         return {}, "missing_pipeline_id"
     if not isinstance(rid, str) or not rid:
         return {}, "missing_run_id"
-    if not isinstance(item.event_type, str) \
-            or item.event_type not in _VALID_EVENT_TYPES:
+    if not isinstance(item.event_type, str):
+        # 字段缺失（None）与类型/取值非法是可区分的两类坏数据
+        return {}, "missing_event_type" if item.event_type is None \
+            else "invalid_event_type"
+    if item.event_type not in _VALID_EVENT_TYPES:
         return {}, "invalid_event_type"
     if not isinstance(item.attempt, int) or isinstance(item.attempt, bool) \
             or item.attempt < 1:
@@ -73,13 +78,22 @@ class Backfiller:
     def __init__(self, store) -> None:
         self._store = store
 
-    def ingest_batch(self, items: list[BackfillItem]) -> BackfillResult:
+    def ingest_batch(self, items: list) -> BackfillResult:
         results: list[BackfillItemResult] = []
         accepted = duplicate = invalid = 0
         # 逐条加锁：与实时上报共用同一把锁，保证“单条处理”原子；
         # 不在整批外持有锁，使读请求与其他上报能在事件之间穿插。
         for index, item in enumerate(items):
             with self._store.lock:
+                if not isinstance(item, BackfillItem):
+                    # 非对象条目（字符串/数字/null 等）：只标自己，不拖垮整批
+                    invalid += 1
+                    results.append(BackfillItemResult(
+                        index=index, status=BackfillItemStatus.INVALID,
+                        reason="item_not_object"))
+                    logger.info("[backfill] idx=%d INVALID item_not_object "
+                                "raw=%r", index, item)
+                    continue
                 norm, bad = validate_item(item)
                 if bad is not None:
                     invalid += 1

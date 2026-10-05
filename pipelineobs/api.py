@@ -151,20 +151,25 @@ def post_alert_check(pipeline_id: str, payload: AlertIn) -> dict:
 # ---------------------------------------------------------------------------
 
 
-class BackfillEventIn(BaseModel):
-    # 放宽入口约束：批次内坏数据必须由回补器逐条给出可区分原因，
-    # 而不是被整体 422 拒掉（模型层只负责接住任意 JSON 形状）
-    pipeline_id: Any = ""
-    run_id: Any = ""
-    attempt: Any = 1
-    event_type: Any = Field(description="started | succeeded | failed")
-    event_ts: Any = Field(default=None, description="事件时间戳；缺失用接收时间")
-    detail: Any = ""
-    received_ts: Any = None
-
-
 class BackfillIn(BaseModel):
-    events: list[BackfillEventIn] = Field(default_factory=list)
+    # 入口只要求 events 是数组；元素可以是任意 JSON 值。
+    # 非对象条目、缺字段、类型错误等都交给回补器逐条给出可区分结论，
+    # 而不是在模型层把整个请求 422 拒掉。
+    events: list[Any] = Field(default_factory=list)
+
+
+def _to_backfill_item(raw: Any) -> Any:
+    """把一条原始 JSON 转成 BackfillItem；非对象原样透传给回补器标记。"""
+    if not isinstance(raw, dict):
+        return raw
+    return BackfillItem(
+        pipeline_id=raw.get("pipeline_id", ""),
+        run_id=raw.get("run_id", ""),
+        attempt=raw.get("attempt", 1),
+        event_type=raw.get("event_type"),      # 缺失 -> None -> missing_event_type
+        event_ts=raw.get("event_ts"),
+        detail=raw.get("detail", ""),
+        received_ts=raw.get("received_ts"))
 
 
 def _jsonable(obj: Any) -> Any:
@@ -185,14 +190,10 @@ def post_events_batch(payload: BackfillIn) -> dict:
     """历史事件批量回补。
 
     与 POST /events 共用同一处理路径：乱序、跨流水线/运行、重复、坏数据
-    混在一批里也逐条给结论；非法事件单独标记，不影响其余事件生效。
+    （含非对象条目、缺 event_type 等）混在一批里也逐条给结论；
+    非法事件单独标记，不影响其余事件生效。
     """
-    items = [
-        BackfillItem(pipeline_id=e.pipeline_id, run_id=e.run_id,
-                     attempt=e.attempt, event_type=e.event_type,
-                     event_ts=e.event_ts, detail=e.detail,
-                     received_ts=e.received_ts)
-        for e in payload.events]
+    items = [_to_backfill_item(e) for e in payload.events]
     logger.info("[backfill] batch input size=%d", len(items))
     result = store.ingest_batch(items)
     logger.info("[backfill] batch result total=%d accepted=%d duplicate=%d "

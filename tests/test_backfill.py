@@ -58,7 +58,72 @@ def test_batch_out_of_order_equals_single_submission():
     assert wb.latencies == wr.latencies
 
 
-def test_batch_per_item_conclusions_and_counts():
+def test_batch_latency_consistent_across_submission_orders():
+    """同一批历史事件换不同提交顺序回补，窗口耗时（avg/p95）与计数完全一致，
+    且与按时间顺序逐条上报的结论一致。"""
+    import itertools
+
+    base = [
+        item("p", "r1", "started", 100),
+        item("p", "r1", "failed", 110),            # 尝试1失败，耗时10
+        item("p", "r1", "started", 120, attempt=2),
+        item("p", "r1", "succeeded", 135, attempt=2),  # 重试成功，耗时15
+        item("p", "r2", "started", 200),
+        item("p", "r2", "succeeded", 240),         # 成功，耗时40
+        item("p", "r3", "started", 300),
+        item("p", "r3", "failed", 330),            # 失败，耗时30
+    ]
+    # 参照：按时间顺序逐条上报
+    ref = _apply_reference(base)
+    ref_w = ref.window("p", 1000, 1000)
+    assert ref_w.avg_latency is not None and ref_w.p95_latency is not None
+
+    orders = [
+        list(reversed(base)),                      # 完全逆序（终态全部先到）
+        base[::2] + base[1::2],                    # 奇偶交错
+        list(base),                                # 时间顺序整批
+    ]
+    # 再加全排列抽查（8 条事件的全排列 40320 种，抽前 200 种）
+    for perm in itertools.islice(itertools.permutations(base), 200):
+        orders.append(list(perm))
+
+    for order in orders:
+        store = PipelineStore()
+        res = store.ingest_batch(order)
+        assert res.invalid == 0
+        w = store.window("p", 1000, 1000)
+        assert (w.total_runs, w.succeeded_runs, w.failed_runs) == (3, 2, 1)
+        assert sorted(w.latencies) == sorted(ref_w.latencies)
+        assert w.avg_latency == ref_w.avg_latency
+        assert w.p95_latency == ref_w.p95_latency
+        # 每个运行的耗时都必须有值且一致
+        assert _snapshot(store) == _snapshot(ref)
+    log.info("latency order-independence verified over %d orders: avg=%s p95=%s",
+             len(orders), ref_w.avg_latency, ref_w.p95_latency)
+
+
+def test_batch_latency_filled_when_terminal_arrives_first():
+    """终态事件先回补、started 后补：耗时必须补上而不是一直为空。"""
+    store = PipelineStore()
+    res = store.ingest_batch([
+        item("p", "r1", "succeeded", 110),         # 终态先到
+        item("p", "r1", "started", 100),           # started 后补
+    ])
+    assert res.invalid == 0
+    attempt = store.get_run("p", "r1").attempts[1]
+    assert attempt.started_ts == 100 and attempt.latency == 10
+    w = store.window("p", 1000, 1000)
+    assert w.avg_latency == 10 and w.p95_latency == 10
+    # 乱序重试同一批：幂等，耗时不被改乱
+    res2 = store.ingest_batch([
+        item("p", "r1", "started", 100),
+        item("p", "r1", "succeeded", 110),
+    ])
+    assert res2.accepted == 0 and res2.duplicate == 2
+    assert store.window("p", 1000, 1000).avg_latency == 10
+
+
+
     store = PipelineStore()
     res = store.ingest_batch([
         item("p", "r1", "started", 100),

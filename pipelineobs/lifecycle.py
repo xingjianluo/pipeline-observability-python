@@ -7,6 +7,9 @@
    - 否则以最大 attempt 的尝试状态为准（running / failed）。
 3. 乱序：同一尝试的终态一经确定，迟到的冲突终态事件不能将其回退；
    冲突时按事件时间戳决胜，时间戳缺失时按到达顺序决胜。
+   终态之后迟到的 started 同样不能回退状态，但它携带的“开始时间”事实
+   仍会被记录（取最早者）并据此重算耗时——因此只要 started 与终态两条
+   事件都到齐，耗时必然有值且与到达顺序无关。
 4. 重试：递增 attempt 表示新尝试，failed 后收到新尝试 started 是合法
    重试（运行重回 running），与原始失败尝试可区分且归属同一 run。
 """
@@ -57,7 +60,8 @@ class LifecycleManager:
         """提交事件，返回 (最新运行状态, 判定依据)。
 
         判定依据：first_event / duplicate_event / attempt_started /
-        attempt_finished / attempt_terminal_held / retry_started。
+        attempt_finished / attempt_terminal_held / attempt_started_late /
+        retry_started。
         """
         with self._lock:
             key = (event.pipeline_id, event.run_id)
@@ -115,11 +119,19 @@ class LifecycleManager:
         ts = event.event_ts if event.event_ts is not None else event.received_ts
 
         if event.event_type is EventType.STARTED:
-            if attempt.status in (RunStatus.SUCCEEDED, RunStatus.FAILED):
-                # 终态之后迟到的 started，不能回退。
-                return False, "attempt_terminal_held"
-            if attempt.started_ts is None or ts < attempt.started_ts:
+            # started 事实按最早时间记录：即使终态已先到，也要补上
+            # started_ts 并重算耗时，保证耗时与事件到达顺序无关。
+            changed = attempt.started_ts is None or ts < attempt.started_ts
+            if changed:
                 attempt.started_ts = ts
+                if attempt.finished_ts is not None:
+                    attempt.latency = max(0.0, attempt.finished_ts - ts)
+            if attempt.status in (RunStatus.SUCCEEDED, RunStatus.FAILED):
+                # 状态不回退；但带回了更早的 started 事实时仍算生效
+                # （耗时被补上/校正），与完全无新信息的空转可区分。
+                if changed:
+                    return True, "attempt_started_late"
+                return False, "attempt_terminal_held"
             attempt.status = RunStatus.RUNNING
             return True, None
 
