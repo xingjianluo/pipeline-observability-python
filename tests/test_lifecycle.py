@@ -86,10 +86,14 @@ def test_stale_old_attempt_cannot_change_conclusion():
     submit(lm, ev("r1", 1, "failed", 110))
     submit(lm, ev("r1", 2, "started", 120))
     submit(lm, ev("r1", 2, "succeeded", 130))
-    # attempt1 迟到的 started 不影响已成功的结论
+    # attempt1 迟到的 started 不影响已成功的运行级结论（状态不回退），
+    # 但仍会补齐该尝试的开始时间（耗时统计因此与到达顺序无关）
     state, reason = submit(lm, ev("r1", 1, "started", 100, recv=140))
     assert state.status is RunStatus.SUCCEEDED
-    assert reason == "attempt_terminal_held"
+    assert reason == "attempt_started"
+    assert state.attempts[1].started_ts == 100
+    assert state.attempts[1].status is RunStatus.FAILED
+    assert state.attempts[1].latency == 10
 
 
 def test_missing_event_ts_uses_receive_order():

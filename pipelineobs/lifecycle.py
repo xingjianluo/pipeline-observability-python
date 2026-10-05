@@ -115,11 +115,21 @@ class LifecycleManager:
         ts = event.event_ts if event.event_ts is not None else event.received_ts
 
         if event.event_type is EventType.STARTED:
-            if attempt.status in (RunStatus.SUCCEEDED, RunStatus.FAILED):
-                # 终态之后迟到的 started，不能回退。
-                return False, "attempt_terminal_held"
-            if attempt.started_ts is None or ts < attempt.started_ts:
+            # started 时间恒取最早值：无论 started 与终态事件谁先到达，
+            # 最终 started_ts 都只取决于事件内容，与到达顺序无关。
+            changed = attempt.started_ts is None or ts < attempt.started_ts
+            if changed:
                 attempt.started_ts = ts
+            if attempt.status in (RunStatus.SUCCEEDED, RunStatus.FAILED):
+                # 终态之后迟到的 started：状态不回退，但仍要补齐开始时间
+                # 并重算耗时——否则乱序回补下“有开始有结束”的运行耗时
+                # 会一直是空，且换个顺序结果就变了。
+                if changed:
+                    if attempt.finished_ts is not None:
+                        attempt.latency = max(
+                            0.0, attempt.finished_ts - attempt.started_ts)
+                    return True, None
+                return False, "attempt_terminal_held"
             attempt.status = RunStatus.RUNNING
             return True, None
 

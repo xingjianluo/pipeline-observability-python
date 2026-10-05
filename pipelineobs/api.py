@@ -10,7 +10,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from .models import BackfillItem, FreshnessState
+from .models import FreshnessState
 from .store import PipelineStore
 
 logger = logging.getLogger("pipelineobs")
@@ -151,20 +151,11 @@ def post_alert_check(pipeline_id: str, payload: AlertIn) -> dict:
 # ---------------------------------------------------------------------------
 
 
-class BackfillEventIn(BaseModel):
-    # 放宽入口约束：批次内坏数据必须由回补器逐条给出可区分原因，
-    # 而不是被整体 422 拒掉（模型层只负责接住任意 JSON 形状）
-    pipeline_id: Any = ""
-    run_id: Any = ""
-    attempt: Any = 1
-    event_type: Any = Field(description="started | succeeded | failed")
-    event_ts: Any = Field(default=None, description="事件时间戳；缺失用接收时间")
-    detail: Any = ""
-    received_ts: Any = None
-
-
 class BackfillIn(BaseModel):
-    events: list[BackfillEventIn] = Field(default_factory=list)
+    # 入口不做任何逐条校验：批次里允许混入任意形状的坏数据
+    # （非对象条目、缺字段、类型错误……），全部由回补器逐条给出
+    # 可区分结论，合法条目照常生效，绝不整批 422。
+    events: list[Any] = Field(default_factory=list)
 
 
 def _jsonable(obj: Any) -> Any:
@@ -186,15 +177,10 @@ def post_events_batch(payload: BackfillIn) -> dict:
 
     与 POST /events 共用同一处理路径：乱序、跨流水线/运行、重复、坏数据
     混在一批里也逐条给结论；非法事件单独标记，不影响其余事件生效。
+    原始 JSON 条目直接透传给回补器逐条校验，入口不整批拒绝。
     """
-    items = [
-        BackfillItem(pipeline_id=e.pipeline_id, run_id=e.run_id,
-                     attempt=e.attempt, event_type=e.event_type,
-                     event_ts=e.event_ts, detail=e.detail,
-                     received_ts=e.received_ts)
-        for e in payload.events]
-    logger.info("[backfill] batch input size=%d", len(items))
-    result = store.ingest_batch(items)
+    logger.info("[backfill] batch input size=%d", len(payload.events))
+    result = store.ingest_batch(payload.events)
     logger.info("[backfill] batch result total=%d accepted=%d duplicate=%d "
                 "invalid=%d", result.total, result.accepted,
                 result.duplicate, result.invalid)

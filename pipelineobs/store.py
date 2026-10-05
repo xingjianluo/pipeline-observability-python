@@ -69,7 +69,10 @@ class PipelineStore:
         agg_reason: str | None = None
         applied = lc_reason not in ("duplicate_event",
                                     "attempt_terminal_held")
-        if state.status is RunStatus.SUCCEEDED and applied:
+        # 新鲜度只由真正的成功终态事件驱动：乱序下迟到的 started 也可能
+        # “生效”（补齐耗时），绝不能把它误记成一次新的成功产出。
+        if state.status is RunStatus.SUCCEEDED and applied \
+                and event.event_type is EventType.SUCCEEDED:
             self._freshness.record_success(event.pipeline_id, event.event_ts)
         # 聚合写入顺序无关的“规范终态结论”：每次都由全部尝试重新推导，
         # 因此同一批事件乱序/并发/重试得到的窗口统计完全一致。

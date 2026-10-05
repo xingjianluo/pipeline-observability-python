@@ -2,6 +2,9 @@
 
 语义保证：
 - 每条事件都有自己的处理结论（accepted / duplicate / invalid + 原因）；
+- 条目可以是 BackfillItem 或原始 dict（HTTP 入口透传的 JSON）；
+  不是对象的条目（字符串/数字/列表等）单独标记 item_not_object，
+  缺事件类型标记 missing_event_type，与类型非法 invalid_event_type 可区分；
 - 合法事件一律调用 store.apply_event —— 与 POST /events 单条上报同一代码路径，
   因此整批结果 == 把这些事件逐条单独上报；
 - 坏数据只影响自己：invalid 事件不进状态机，其余事件照常生效；
@@ -38,33 +41,53 @@ def _is_real_number(v: object) -> bool:
         and not (isinstance(v, float) and (math.isnan(v) or math.isinf(v)))
 
 
-def validate_item(item: BackfillItem) -> tuple[dict, str | None]:
-    """校验并归一化一条事件。返回 (归一化字段, 不合法原因)；合法原因为 None。"""
-    pid = item.pipeline_id
-    rid = item.run_id
+def _raw_fields(item) -> tuple | None:
+    """从 BackfillItem 或原始 dict 提取字段；非对象条目返回 None。"""
+    if isinstance(item, BackfillItem):
+        return (item.pipeline_id, item.run_id, item.attempt, item.event_type,
+                item.event_ts, item.detail, item.received_ts)
+    if isinstance(item, dict):
+        return (item.get("pipeline_id"), item.get("run_id"),
+                item.get("attempt", 1), item.get("event_type"),
+                item.get("event_ts"), item.get("detail", ""),
+                item.get("received_ts"))
+    return None
+
+
+def validate_item(item) -> tuple[dict, str | None]:
+    """校验并归一化一条事件。返回 (归一化字段, 不合法原因)；合法原因为 None。
+
+    接受 BackfillItem 或原始 dict（HTTP 入口直接透传的 JSON 条目）；
+    不是对象的条目（字符串/数字/列表等）标记为 item_not_object，
+    只影响自己，不拖垮整批。
+    """
+    fields = _raw_fields(item)
+    if fields is None:
+        return {}, "item_not_object"
+    pid, rid, attempt, etype, ets, detail, rts = fields
     if not isinstance(pid, str) or not pid:
         return {}, "missing_pipeline_id"
     if not isinstance(rid, str) or not rid:
         return {}, "missing_run_id"
-    if not isinstance(item.event_type, str) \
-            or item.event_type not in _VALID_EVENT_TYPES:
+    if etype is None:
+        return {}, "missing_event_type"
+    if not isinstance(etype, str) or etype not in _VALID_EVENT_TYPES:
         return {}, "invalid_event_type"
-    if not isinstance(item.attempt, int) or isinstance(item.attempt, bool) \
-            or item.attempt < 1:
+    if not isinstance(attempt, int) or isinstance(attempt, bool) \
+            or attempt < 1:
         return {}, "invalid_attempt"
-    if item.event_ts is not None and not _is_real_number(item.event_ts):
+    if ets is not None and not _is_real_number(ets):
         return {}, "invalid_event_ts"
-    if item.received_ts is not None and not _is_real_number(item.received_ts):
+    if rts is not None and not _is_real_number(rts):
         return {}, "invalid_received_ts"
-    if not isinstance(item.detail, str):
+    if not isinstance(detail, str):
         return {}, "invalid_detail"
     norm = {
-        "pipeline_id": pid, "run_id": rid, "attempt": item.attempt,
-        "event_type": item.event_type,
-        "event_ts": float(item.event_ts) if item.event_ts is not None else None,
-        "detail": item.detail,
-        "received_ts": (float(item.received_ts)
-                        if item.received_ts is not None else None),
+        "pipeline_id": pid, "run_id": rid, "attempt": attempt,
+        "event_type": etype,
+        "event_ts": float(ets) if ets is not None else None,
+        "detail": detail,
+        "received_ts": float(rts) if rts is not None else None,
     }
     return norm, None
 
@@ -73,7 +96,7 @@ class Backfiller:
     def __init__(self, store) -> None:
         self._store = store
 
-    def ingest_batch(self, items: list[BackfillItem]) -> BackfillResult:
+    def ingest_batch(self, items: list) -> BackfillResult:
         results: list[BackfillItemResult] = []
         accepted = duplicate = invalid = 0
         # 逐条加锁：与实时上报共用同一把锁，保证“单条处理”原子；
@@ -87,10 +110,8 @@ class Backfiller:
                         index=index, status=BackfillItemStatus.INVALID,
                         reason=bad))
                     logger.info(
-                        "[backfill] idx=%d INVALID input pipeline=%s run=%s "
-                        "attempt=%s event=%s ts=%s reason=%s",
-                        index, item.pipeline_id, item.run_id, item.attempt,
-                        item.event_type, item.event_ts, bad)
+                        "[backfill] idx=%d INVALID input=%r reason=%s",
+                        index, item, bad)
                     continue
 
                 recv = norm["received_ts"]

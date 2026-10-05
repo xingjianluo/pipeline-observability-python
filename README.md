@@ -30,6 +30,10 @@
   - 迟到事件不能让已进入终态的尝试回退（`attempt_terminal_held`）；
   - 同一尝试出现冲突终态时，按**事件时间戳**决胜；时间戳缺失时按**接收顺序**
     决胜（先到的终态成立）。
+  - 迟到的 `started` 不改变已终态尝试的状态，但仍会补齐 `started_ts` 并重算
+    耗时：最终 `started_ts` 恒取所有 `started` 事件的最早时间，耗时
+    `max(0, finished_ts - started_ts)` 只取决于事件内容，**与到达顺序无关**——
+    结束事件先于开始事件到达的运行，耗时同样能算出，不会留空。
   - `failed` 后收到新尝试的 `started` 是合法重试（`retry_started`），运行
     重新 `running`；旧尝试的迟到事件不会影响新结论。
 - **聚合单元是“运行”**：一个 `run_id` 在窗口中只出现一次，取最终收敛结论。
@@ -93,10 +97,18 @@
   invalid`。
 - **与单条上报完全等价**：合法事件一律走与 `POST /events` 相同的
   `store.apply_event` 处理路径，整批最终结果等同于把同样事件一条条单独上报。
-- **坏数据不拖垮整批**：不合法事件不进入状态机，其余事件照常生效，且原因可区分：
-  `missing_pipeline_id` / `missing_run_id` / `invalid_event_type` /
-  `invalid_attempt` / `invalid_event_ts` / `invalid_received_ts` /
-  `invalid_detail`。
+- **坏数据不拖垮整批**：入口对批次内容**不做整批校验**——`events` 里可以混入
+  任意形状的条目（非对象的字符串/数字/数组、缺字段、类型错误），请求不会
+  被整体 422 打回；每条不合法数据单独标记 `invalid` 且不进入状态机，其余
+  事件照常生效。原因可区分：
+  `item_not_object`（条目不是对象）/ `missing_pipeline_id` /
+  `missing_run_id` / `missing_event_type`（缺事件类型字段）/
+  `invalid_event_type`（类型值非法）/ `invalid_attempt` / `invalid_event_ts` /
+  `invalid_received_ts` / `invalid_detail`。
+- **乱序下耗时一致**：耗时与计数、成功失败数一样是顺序无关的——同一批历史
+  事件换个提交顺序再补，窗口里的平均耗时与 P95 完全相同，且与把这些事件
+  按时间顺序逐条上报得到的结论一致（由“迟到 `started` 仍补齐开始时间”与
+  规范终态写入共同保证）。
 - **幂等**：重复提交同一批（哪怕乱序重试）只会得到 `duplicate`，不多算、
   不重复告警——去重仍由生命周期的 `(run, attempt, event_type)` 与聚合的规范终态
   写入共同保证。
@@ -154,7 +166,7 @@ curl -X POST localhost:8000/api/v1/events -H 'Content-Type: application/json' -d
 响应中 `lifecycle_reason` / `aggregate_reason` 给出该次上报的判定依据；
 `unknown` 新鲜度的 `reason` 字段给出可区分的失败原因。
 
-批量回补示例（顺序可乱、可重复、可夹带坏数据）：
+批量回补示例（顺序可乱、可重复、可夹带坏数据，包括非对象条目）：
 
 ```bash
 curl -X POST localhost:8000/api/v1/events:batch \
@@ -162,10 +174,16 @@ curl -X POST localhost:8000/api/v1/events:batch \
   {"pipeline_id":"p","run_id":"r1","event_type":"started","event_ts":100},
   {"pipeline_id":"p","run_id":"r1","event_type":"succeeded","event_ts":110},
   {"pipeline_id":"p","run_id":"r1","event_type":"succeeded","event_ts":110},
+  "oops-not-an-object",
+  {"pipeline_id":"p","run_id":"r2","event_ts":120},
   {"pipeline_id":"p","run_id":"x","attempt":0,"event_type":"weird"}
 ]}'
-# => {"total":4,"accepted":2,"duplicate":1,"invalid":1,
-#     "results":[{"index":3,"status":"invalid","reason":"invalid_event_type", ...}]}
+# => {"total":6,"accepted":2,"duplicate":1,"invalid":3,
+#     "results":[...,
+#       {"index":3,"status":"invalid","reason":"item_not_object"},
+#       {"index":4,"status":"invalid","reason":"missing_event_type"},
+#       {"index":5,"status":"invalid","reason":"invalid_event_type"}]}
+# 合法的两条照常生效：r1 收敛为 succeeded，耗时 10（110-100）。
 ```
 
 追溯重算示例（复盘 `end=200` 之前的 `[0,200)` 窗口，阈值 2）：
@@ -186,10 +204,10 @@ uv run pytest                       # 运行全部单测（日志实时打印输
 uv run uvicorn main:app --reload    # 启动服务
 ```
 
-测试覆盖（共 47 个用例）：
+测试覆盖（共 53 个用例）：
 
 - `tests/test_lifecycle.py`：重复上报、乱序上报、顺序无关收敛、重试区分、
-  旧尝试迟到事件、时间戳缺失；
+  旧尝试迟到事件（迟到 `started` 补齐耗时但不回退终态）、时间戳缺失；
 - `tests/test_freshness.py`：fresh/lagging/stale 边界、时钟回拨、时间戳/间隔
   缺失、间隔调小需确认、调大免确认；
 - `tests/test_aggregation.py`：半开窗口边界、成功率与 p95、幂等、告警阈值/
@@ -198,6 +216,10 @@ uv run uvicorn main:app --reload    # 启动服务
   并发上报一致性；
 - `tests/test_backfill.py`：乱序批量与逐条单报等价、逐条结论、部分失败原因
   可区分且不丢合法事件、重复/乱序批次幂等、跨流水线、失败后重试成功只计一次；
+- `tests/test_backfill_robustness.py`：回补健壮性回归——真实入口混入非对象
+  条目与缺事件类型字段时逐条给结论且合法条目照常生效、乱序回补的耗时
+  （avg/P95）与按序逐条上报一致、结束先于开始到达也能算出耗时、回补与实时
+  上报并发后状态/窗口（含耗时）/告警稳定、乱序批次重试多遍幂等；
 - `tests/test_replay.py`：截至时刻截断重建、失败→重试成功的差异、
   重算不改在线状态/不真发告警/不消费抑制、无差异场景、与“当时逐条上报”一致；
 - `tests/test_concurrency.py`：回补与实时上报并发最终结论与任意逐条顺序一致、
@@ -206,4 +228,19 @@ uv run uvicorn main:app --reload    # 启动服务
   重算无告警副作用、与单条上报入口并发及原有用法兼容。
 
 单测以 `log_cli` 实时输出形如
-`INPUT ... => DECISION state=... reason=...` 的输入与判定依据。
+`INPUT ... => DECISION state=... reason=...` 的输入与判定依据；
+回补相关用例还会逐条打印 `[backfill] idx=N accepted/duplicate/INVALID ...`
+与每个乱序排列的窗口统计对比结果。
+
+### 本地验证这几类场景
+
+```bash
+# 坏数据逐条结论（非对象条目、缺事件类型）
+uv run pytest tests/test_backfill_robustness.py -k mixed_bad_items -v
+# 乱序回补耗时一致性（6 种排列对照按序参照）
+uv run pytest tests/test_backfill_robustness.py -k latency -v
+# 回补与实时并发 / 乱序批次重试幂等
+uv run pytest tests/test_backfill_robustness.py -k "concurrent or idempotent" -v
+# 原有用例回归
+uv run pytest
+```
